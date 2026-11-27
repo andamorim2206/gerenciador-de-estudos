@@ -26,9 +26,31 @@ final class Database
         return self::$pdo;
     }
 
-    /** Configuração lida das variáveis de ambiente. */
+    /**
+     * Configuração lida das variáveis de ambiente, nesta ordem:
+     * DATABASE_URL (ou POSTGRES_URL, como as integrações da Vercel injetam), DB_HOST/DB_*, e por fim SQLite.
+     */
     public static function config(): array
     {
+        $url = getenv('DATABASE_URL') ?: getenv('POSTGRES_URL');
+        if ($url) {
+            $partes = parse_url($url);
+            if (!$partes || !isset($partes['host']) || !in_array($partes['scheme'] ?? '', ['postgres', 'postgresql'], true)) {
+                throw new \RuntimeException('DATABASE_URL inválida: use postgresql://usuario:senha@host/banco');
+            }
+            parse_str($partes['query'] ?? '', $query);
+            return [
+                'driver' => 'pgsql',
+                'host' => $partes['host'],
+                'port' => (string) ($partes['port'] ?? '5432'),
+                'dbname' => ltrim($partes['path'] ?? '', '/') ?: 'postgres',
+                'user' => rawurldecode($partes['user'] ?? ''),
+                'password' => rawurldecode($partes['pass'] ?? ''),
+                'sslmode' => $query['sslmode'] ?? null,
+                'channel_binding' => $query['channel_binding'] ?? null,
+                'schema' => null,
+            ];
+        }
         if (getenv('DB_HOST')) {
             return [
                 'driver' => 'pgsql',
@@ -37,6 +59,7 @@ final class Database
                 'dbname' => getenv('DB_NAME') ?: 'estudos',
                 'user' => getenv('DB_USER') ?: 'estudos',
                 'password' => getenv('DB_PASSWORD') ?: '',
+                'sslmode' => getenv('DB_SSLMODE') ?: null,
                 'schema' => null,
             ];
         }
@@ -52,13 +75,17 @@ final class Database
         ];
 
         if ($config['driver'] === 'pgsql') {
-            // Datas gravadas e comparadas no horário de Brasília, como no resto do app.
-            $parametros = '-c TimeZone=America/Sao_Paulo';
-            if ($config['schema']) {
-                $parametros .= ' -c search_path=' . $config['schema'] . ',public';
+            $dsn = sprintf('pgsql:host=%s;port=%s;dbname=%s', $config['host'], $config['port'], $config['dbname']);
+            foreach (['sslmode', 'channel_binding'] as $chave) {
+                if (!empty($config[$chave])) {
+                    $dsn .= ";$chave=" . $config[$chave];
+                }
             }
-            $dsn = sprintf("pgsql:host=%s;port=%s;dbname=%s;options='%s'",
-                $config['host'], $config['port'], $config['dbname'], $parametros);
+            // Só os testes usam schema próprio. Não dá para mandar "options" sempre: poolers como o
+            // PgBouncer (Neon, Supabase) recusam esse parâmetro. O fuso fica no próprio banco (migração 002).
+            if (!empty($config['schema'])) {
+                $dsn .= ";options='-c search_path={$config['schema']},public'";
+            }
             return new PDO($dsn, $config['user'], $config['password'], $opcoes);
         }
 
@@ -111,38 +138,47 @@ final class Database
      */
     public static function migrar(PDO $pdo, array $config): void
     {
-        $postgres = self::ehPostgres($pdo);
-        if ($postgres) {
-            // Dois processos subindo ao mesmo tempo não aplicam a mesma migração duas vezes.
-            $pdo->exec('SELECT pg_advisory_lock(714023)');
-        }
-        try {
-            $pdo->exec('CREATE TABLE IF NOT EXISTS schema_migrations (
-                versao TEXT PRIMARY KEY,
-                aplicada_em TEXT NOT NULL
-            )');
+        if (!self::ehPostgres($pdo)) {
+            $pdo->exec('CREATE TABLE IF NOT EXISTS schema_migrations (versao TEXT PRIMARY KEY, aplicada_em TEXT NOT NULL)');
             $aplicadas = $pdo->query('SELECT versao FROM schema_migrations')->fetchAll(PDO::FETCH_COLUMN);
-
-            $pendentes = [];
-            foreach (glob(RAIZ . '/migrations/' . ($postgres ? 'pgsql/' : '') . '*.php') as $caminho) {
-                $versao = basename($caminho, '.php');
-                if (!in_array($versao, $aplicadas, true)) {
-                    $pendentes[$versao] = $caminho;
-                }
+            if ($pendentes = self::pendentes(RAIZ . '/migrations', $aplicadas)) {
+                self::migrarSqlite($pdo, $config['arquivo'], $aplicadas, $pendentes);
             }
-            if (!$pendentes) {
-                return;
-            }
-            ksort($pendentes);
+            return;
+        }
 
-            $postgres
-                ? self::aplicar($pdo, $pendentes)
-                : self::migrarSqlite($pdo, $config['arquivo'], $aplicadas, $pendentes);
-        } finally {
-            if ($postgres) {
-                $pdo->exec('SELECT pg_advisory_unlock(714023)');
+        // Caminho rápido (roda a cada requisição na Vercel): uma consulta e nada mais se estiver em dia.
+        // Só vale a tabela do schema atual (os testes usam um schema próprio com "public" no search_path).
+        if ($pdo->query("SELECT to_regclass(quote_ident(current_schema()) || '.schema_migrations') IS NOT NULL")->fetchColumn()
+            && !self::pendentes(RAIZ . '/migrations/pgsql', $pdo->query('SELECT versao FROM schema_migrations')->fetchAll(PDO::FETCH_COLUMN))) {
+            return;
+        }
+
+        // Tudo numa transação, com um lock que só vale dentro dela (funciona atrás de pooler):
+        // duas instâncias subindo juntas não aplicam a mesma migração duas vezes.
+        self::transacao($pdo, function (PDO $pdo) {
+            $pdo->exec('SELECT pg_advisory_xact_lock(714023)');
+            $pdo->exec('CREATE TABLE IF NOT EXISTS schema_migrations (versao TEXT PRIMARY KEY, aplicada_em TEXT NOT NULL)');
+            $aplicadas = $pdo->query('SELECT versao FROM schema_migrations')->fetchAll(PDO::FETCH_COLUMN);
+            foreach (self::pendentes(RAIZ . '/migrations/pgsql', $aplicadas) as $versao => $caminho) {
+                (require $caminho)($pdo);
+                $pdo->prepare('INSERT INTO schema_migrations (versao, aplicada_em) VALUES (?, ?)')->execute([$versao, agora()]);
+            }
+        });
+    }
+
+    /** Migrações de $dir ainda não aplicadas, em ordem: [versão => caminho]. */
+    private static function pendentes(string $dir, array $aplicadas): array
+    {
+        $pendentes = [];
+        foreach (glob($dir . '/*.php') as $caminho) {
+            $versao = basename($caminho, '.php');
+            if (!in_array($versao, $aplicadas, true)) {
+                $pendentes[$versao] = $caminho;
             }
         }
+        ksort($pendentes);
+        return $pendentes;
     }
 
     private static function migrarSqlite(PDO $pdo, string $arquivo, array $aplicadas, array $pendentes): void
@@ -156,29 +192,20 @@ final class Database
         // Reconstruir tabelas exige as FKs desligadas (senão DROP TABLE apaga em cascata).
         $pdo->exec('PRAGMA foreign_keys = OFF');
         try {
-            self::aplicar($pdo, $pendentes, function (PDO $pdo, string $versao) {
-                if ($pdo->query('PRAGMA foreign_key_check')->fetchAll()) {
-                    throw new \RuntimeException("Migração $versao deixou chaves estrangeiras inválidas.");
-                }
-            });
+            // Cada migração roda na sua própria transação, junto com o registro em schema_migrations.
+            foreach ($pendentes as $versao => $caminho) {
+                $migracao = require $caminho;
+                self::transacao($pdo, function (PDO $pdo) use ($migracao, $versao) {
+                    $migracao($pdo);
+                    if ($pdo->query('PRAGMA foreign_key_check')->fetchAll()) {
+                        throw new \RuntimeException("Migração $versao deixou chaves estrangeiras inválidas.");
+                    }
+                    $pdo->prepare('INSERT INTO schema_migrations (versao, aplicada_em) VALUES (?, ?)')
+                        ->execute([$versao, agora()]);
+                });
+            }
         } finally {
             $pdo->exec('PRAGMA foreign_keys = ON');
-        }
-    }
-
-    /** Cada migração roda na sua própria transação, junto com o registro em schema_migrations. */
-    private static function aplicar(PDO $pdo, array $pendentes, ?callable $conferir = null): void
-    {
-        foreach ($pendentes as $versao => $caminho) {
-            $migracao = require $caminho;
-            self::transacao($pdo, function (PDO $pdo) use ($migracao, $versao, $conferir) {
-                $migracao($pdo);
-                if ($conferir) {
-                    $conferir($pdo, $versao);
-                }
-                $pdo->prepare('INSERT INTO schema_migrations (versao, aplicada_em) VALUES (?, ?)')
-                    ->execute([$versao, agora()]);
-            });
         }
     }
 }

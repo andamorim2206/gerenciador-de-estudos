@@ -17,6 +17,10 @@ if (PHP_SAPI === 'cli-server') {
 
 require __DIR__ . '/../src/bootstrap.php';
 
+// No PostgreSQL, o login fica no banco (vale em qualquer instância, inclusive na Vercel).
+if (Database::ehPostgres(Database::pdo())) {
+    App\SessoesLogin::registrar(Database::pdo());
+}
 session_start(['cookie_httponly' => true, 'cookie_samesite' => 'Lax', 'use_strict_mode' => true]);
 
 $metodo = $_SERVER['REQUEST_METHOD'];

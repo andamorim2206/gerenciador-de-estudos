@@ -59,10 +59,11 @@ final class Tarefas
         $serie = $semanas ? bin2hex(random_bytes(8)) : null;
 
         Database::transacao($pdo, function (PDO $pdo) use ($materiaId, $titulo, $dia, $semanas, $serie) {
-            $stmt = $pdo->prepare('INSERT INTO tarefas (materia_id, titulo, data, serie) VALUES (?, ?, ?, ?)');
+            $stmt = $pdo->prepare('INSERT INTO tarefas (materia_id, titulo, data, serie, criada_em) VALUES (?, ?, ?, ?, ?)');
             $data = new DateTimeImmutable($dia);
+            $agora = agora();
             for ($i = 0; $i < max(1, $semanas); $i++) {
-                $stmt->execute([$materiaId, $titulo, $data->modify("+$i week")->format('Y-m-d'), $serie]);
+                $stmt->execute([$materiaId, $titulo, $data->modify("+$i week")->format('Y-m-d'), $serie, $agora]);
             }
         });
         return $semanas;

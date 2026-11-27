@@ -1,0 +1,17 @@
+# Imagem para a Vercel (Vercel Functions com container): FrankenPHP = PHP + servidor Caddy.
+# O nome "Dockerfile.vercel" faz a Vercel usar este arquivo; o Dockerfile comum continua para o docker compose.
+FROM dunglas/frankenphp:1-php8.4-alpine
+
+# pdo_pgsql para o PostgreSQL; mbstring já vem na imagem.
+RUN install-php-extensions pdo_pgsql \
+    && cp "$PHP_INI_DIR/php.ini-production" "$PHP_INI_DIR/php.ini" \
+    && echo "date.timezone=America/Sao_Paulo" > "$PHP_INI_DIR/conf.d/timezone.ini"
+
+WORKDIR /app
+COPY . .
+COPY Caddyfile /etc/caddy/Caddyfile
+
+# A Vercel encaminha as requisições para a porta $PORT (80 se não for definida).
+ENV PORT=80
+
+CMD ["frankenphp", "run", "--config", "/etc/caddy/Caddyfile"]

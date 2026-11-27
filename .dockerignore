@@ -4,3 +4,7 @@ data
 Dockerfile
 docker-compose.yml
 .dockerignore
+.env
+.env.*
+Dockerfile.vercel
+.vercelignore

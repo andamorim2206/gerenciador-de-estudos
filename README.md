@@ -52,11 +52,44 @@ docker compose down                 # parar
 - `docker compose down -v` **apaga** o volume do banco; sem o `-v`, os dados ficam.
 - O container do app roda com UID/GID 1000; se o seu usuário for outro, use `UID=$(id -u) GID=$(id -g) docker compose up -d`.
 
+## Publicando na Vercel
+
+A Vercel roda o app como container (Vercel Functions com imagem Docker, **em beta**) usando `Dockerfile.vercel`
+e `Caddyfile` (FrankenPHP = PHP + servidor Caddy). Como as instâncias não guardam arquivos, o banco precisa ser
+um PostgreSQL externo; o login também fica no banco (tabela `sessoes_login`).
+
+1. **Banco**: no painel do projeto na Vercel, *Storage* → crie um Postgres pelo Marketplace (Neon, Supabase…).
+   A integração cria a variável `DATABASE_URL` (ou `POSTGRES_URL`), que o app já entende, inclusive com `sslmode=require`.
+   Se for configurar à mão: *Settings → Environment Variables* → `DATABASE_URL=postgresql://usuario:senha@host/banco?sslmode=require`.
+2. **Deploy** (precisa do Node para o `npx`):
+   ```bash
+   npx vercel login
+   npx vercel deploy          # prévia
+   npx vercel deploy --prod   # produção
+   ```
+   As tabelas são criadas sozinhas na primeira requisição. Os bancos de `data/` não são enviados (`.vercelignore`).
+3. **Levar os dados atuais** (do PostgreSQL local para o da Vercel, **antes** do primeiro acesso ao site, com o banco vazio):
+   ```bash
+   export DATABASE_URL='postgresql://...'   # a mesma da Vercel
+   docker compose exec -T db pg_dump -U estudos --no-owner --no-privileges estudos \
+     | docker run --rm -i postgres:17-alpine psql -v ON_ERROR_STOP=1 "$DATABASE_URL"
+   docker run --rm postgres:17-alpine psql "$DATABASE_URL" \
+     -c "DO \$\$ BEGIN EXECUTE format('ALTER DATABASE %I SET TimeZone TO %L', current_database(), 'America/Sao_Paulo'); END \$\$"
+   ```
+   (o último comando fixa o fuso de Brasília no banco novo, que o `pg_dump` não leva).
+
+Para testar a imagem da Vercel localmente: `docker build -f Dockerfile.vercel -t estudos-vercel .` e
+`docker run -p 8080:80 -e DATABASE_URL=... estudos-vercel`.
+
+Limites a ter em mente: a instância dorme após alguns minutos sem acesso (o primeiro acesso depois disso demora
+um pouco mais), e requisições duram no máximo 300 s, o que não afeta o app (o cronômetro roda no navegador e a
+sessão fica salva no banco).
+
 ## Scripts
 
 | Comando | O que faz |
 | --- | --- |
-| `php -n tests/run.php` | Testes das regras de XP, moedas e loja, incluindo concorrência (no PostgreSQL se `DB_HOST` estiver definido, cada teste num schema temporário; senão, no SQLite) |
+| `php -n tests/run.php` | Testes das regras de XP, moedas e loja, incluindo concorrência (no PostgreSQL se `DB_HOST` estiver definido, cada teste num schema temporário; senão, no SQLite). No Docker, use um banco separado: `docker compose exec db createdb -U estudos estudos_teste` (uma vez) e `docker compose exec -e DB_NAME=estudos_teste app php tests/run.php` |
 | `php -n bin/verificar-consistencia.php` | Confere saldo = soma do extrato e XP = soma das sessões para todos os usuários |
 | `php -n bin/ajustar-moedas.php email valor "motivo"` | Correção manual de saldo, registrada no extrato |
 | `php bin/migrar-sqlite-para-postgres.php [arquivo]` | Copia todos os dados de um SQLite para o PostgreSQL vazio, mantendo os ids |

@@ -69,6 +69,12 @@ function banco_novo(): array
     $GLOBALS['temporarios'][] = $config;
     $pdo = Database::conectar($config);
     Database::migrar($pdo, $config);
+    // Trava de segurança: os testes nunca podem gravar no banco de verdade.
+    if ($config['driver'] === 'pgsql'
+        && !$pdo->query("SELECT to_regclass('{$config['schema']}.usuarios') IS NOT NULL")->fetchColumn()) {
+        fwrite(STDERR, "ERRO: as tabelas não foram criadas no schema de teste {$config['schema']}; abortando.\n");
+        exit(2);
+    }
     return [$pdo, $config];
 }
 

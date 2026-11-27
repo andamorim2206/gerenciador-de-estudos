@@ -1,0 +1,13 @@
+{
+	admin off
+	auto_https off
+	frankenphp
+}
+
+# Escuta em todas as interfaces na porta $PORT (padrão 80), como a Vercel espera.
+:{$PORT:80} {
+	root * /app/public
+	encode zstd gzip
+	# Arquivos de public/ (assets) são servidos direto; o resto vai para public/index.php.
+	php_server
+}

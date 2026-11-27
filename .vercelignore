@@ -1,0 +1,9 @@
+# Não enviar para a Vercel: bancos locais (têm dados pessoais), git e arquivos só do ambiente local.
+.git
+data
+*.sqlite*
+.teste-docker
+.env
+.env.*
+docker-compose.yml
+iniciar.sh
