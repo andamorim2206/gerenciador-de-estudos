@@ -43,7 +43,7 @@ final class Auth
             $id = self::criarUsuario($pdo, $email, $nome, $senha);
         } catch (\PDOException $e) {
             // Dois cadastros simultâneos com o mesmo e-mail: o UNIQUE do banco barra o segundo.
-            if (str_contains($e->getMessage(), 'UNIQUE')) {
+            if (Database::violaUnicidade($e)) {
                 throw new \DomainException('Já existe uma conta com esse e-mail.');
             }
             throw $e;

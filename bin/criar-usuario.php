@@ -32,7 +32,7 @@ try {
     fwrite(STDERR, 'Erro: ' . $e->getMessage() . "\n");
     exit(1);
 } catch (PDOException $e) {
-    fwrite(STDERR, str_contains($e->getMessage(), 'UNIQUE') ? "Erro: já existe uma conta com esse e-mail.\n" : 'Erro: ' . $e->getMessage() . "\n");
+    fwrite(STDERR, Database::violaUnicidade($e) ? "Erro: já existe uma conta com esse e-mail.\n" : 'Erro: ' . $e->getMessage() . "\n");
     exit(1);
 }
 

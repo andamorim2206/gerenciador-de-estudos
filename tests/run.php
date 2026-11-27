@@ -3,7 +3,8 @@
 declare(strict_types=1);
 
 // Testes das regras de gamificação, sem dependências externas.
-// Uso: php tests/run.php   (cada teste roda num banco SQLite temporário)
+// Uso: php tests/run.php
+// Com DB_HOST definido, cada teste roda num schema temporário do PostgreSQL; senão, num SQLite temporário.
 
 require __DIR__ . '/../src/bootstrap.php';
 
@@ -50,14 +51,25 @@ function lanca(string $classe, callable $fn, ?string $mensagem = null): void
     throw new RuntimeException("esperava a exceção $classe");
 }
 
-/** Banco novo e migrado; devolve [pdo, arquivo]. */
+function usa_postgres(): bool
+{
+    return Database::config()['driver'] === 'pgsql';
+}
+
+/** Banco novo e migrado; devolve [pdo, config] (a config serve para abrir outras conexões). */
 function banco_novo(): array
 {
-    $arquivo = tempnam(sys_get_temp_dir(), 'estudos-teste-') . '.sqlite';
-    $GLOBALS['temporarios'][] = $arquivo;
-    $pdo = Database::conectar($arquivo);
-    Database::migrar($pdo, $arquivo);
-    return [$pdo, $arquivo];
+    $config = Database::config();
+    if ($config['driver'] === 'pgsql') {
+        $config['schema'] = 'teste_' . getmypid() . '_' . count($GLOBALS['temporarios'] ?? []);
+        Database::conectar($config)->exec("CREATE SCHEMA {$config['schema']}");
+    } else {
+        $config['arquivo'] = tempnam(sys_get_temp_dir(), 'estudos-teste-') . '.sqlite';
+    }
+    $GLOBALS['temporarios'][] = $config;
+    $pdo = Database::conectar($config);
+    Database::migrar($pdo, $config);
+    return [$pdo, $config];
 }
 
 function usuario(PDO $pdo, string $email = 'davi@exemplo.com'): int
@@ -97,25 +109,29 @@ function contar(PDO $pdo, string $sql, array $params = []): int
 }
 
 /** Roda $fn em $n processos paralelos, cada um com sua conexão; devolve quantos terminaram com sucesso. */
-function em_paralelo(string $arquivo, int $n, callable $fn): int
+function em_paralelo(array $config, int $n, callable $fn): int
 {
     $pids = [];
     for ($i = 0; $i < $n; $i++) {
+        $resultado = tempnam(sys_get_temp_dir(), 'estudos-paralelo-');
         $pid = pcntl_fork();
         if ($pid === 0) {
             try {
-                $ok = $fn(Database::conectar($arquivo), $i);
-                exit($ok ? 0 : 1);
+                $ok = $fn(Database::conectar($config), $i);
             } catch (Throwable) {
-                exit(1);
+                $ok = false;
             }
+            file_put_contents($resultado, $ok ? '1' : '0');
+            // Sai sem rodar destrutores: a conexão herdada do processo pai não pode ser encerrada aqui.
+            posix_kill(getmypid(), SIGKILL);
         }
-        $pids[] = $pid;
+        $pids[$pid] = $resultado;
     }
     $sucessos = 0;
-    foreach ($pids as $pid) {
+    foreach ($pids as $pid => $resultado) {
         pcntl_waitpid($pid, $status);
-        $sucessos += pcntl_wexitstatus($status) === 0 ? 1 : 0;
+        $sucessos += file_get_contents($resultado) === '1' ? 1 : 0;
+        unlink($resultado);
     }
     return $sucessos;
 }
@@ -133,16 +149,16 @@ teste('usuário novo começa com carteira 0 e neurônio no estágio 0', function
 
 teste('migração do protótipo preserva matérias e tarefas e descarta as moedas antigas', function () {
     $original = RAIZ . '/data/estudos.antes-do-mvp.sqlite';
-    if (!is_file($original)) {
-        return; // sem banco do protótipo nesta máquina
+    if (!is_file($original) || usa_postgres()) {
+        return; // sem banco do protótipo nesta máquina (ou rodando no PostgreSQL, que não tem migração legada)
     }
-    $arquivo = tempnam(sys_get_temp_dir(), 'estudos-legado-') . '.sqlite';
-    $GLOBALS['temporarios'][] = $arquivo;
-    copy($original, $arquivo);
-    $pdo = Database::conectar($arquivo);
+    $config = ['driver' => 'sqlite', 'arquivo' => tempnam(sys_get_temp_dir(), 'estudos-legado-') . '.sqlite'];
+    $GLOBALS['temporarios'][] = $config;
+    copy($original, $config['arquivo']);
+    $pdo = Database::conectar($config);
     $materias = (int) $pdo->query('SELECT COUNT(*) FROM materias')->fetchColumn();
     $tarefas = (int) $pdo->query('SELECT COUNT(*) FROM tarefas')->fetchColumn();
-    Database::migrar($pdo, $arquivo);
+    Database::migrar($pdo, $config);
 
     igual($materias, contar($pdo, 'SELECT COUNT(*) FROM materias'));
     igual($tarefas, contar($pdo, 'SELECT COUNT(*) FROM tarefas'));
@@ -366,12 +382,12 @@ teste('extrato e sessões concluídas são imutáveis no banco', function () {
 });
 
 teste('5 conclusões simultâneas da mesma sessão geram uma única moeda', function () {
-    [$pdo, $arquivo] = banco_novo();
+    [$pdo, $config] = banco_novo();
     $u = usuario($pdo);
     $m = Materias::criar($pdo, $u, 'Física');
     $s = Sessoes::iniciar($pdo, $u, $m, 25, momento('2026-11-02 10:00:00'));
 
-    $sucessos = em_paralelo($arquivo, 5, fn(PDO $pdo) =>
+    $sucessos = em_paralelo($config, 5, fn(PDO $pdo) =>
         Sessoes::concluir($pdo, $u, $s, momento('2026-11-02 10:25:00')) !== null);
 
     igual(1, $sucessos, 'conclusões que concederam recompensa');
@@ -381,12 +397,12 @@ teste('5 conclusões simultâneas da mesma sessão geram uma única moeda', func
 });
 
 teste('compras simultâneas nunca deixam o saldo negativo', function () {
-    [$pdo, $arquivo] = banco_novo();
+    [$pdo, $config] = banco_novo();
     $u = usuario($pdo);
     dar_moedas($pdo, $u, 6);
     $itens = [item_id($pdo, 'skin-neon'), item_id($pdo, 'cenario-noite')]; // 5 e 6 moedas
 
-    $sucessos = em_paralelo($arquivo, 2, fn(PDO $pdo, int $i) => (bool) Loja::comprar($pdo, $u, $itens[$i], agora()));
+    $sucessos = em_paralelo($config, 2, fn(PDO $pdo, int $i) => (bool) Loja::comprar($pdo, $u, $itens[$i], agora()));
 
     igual(1, $sucessos, 'compras aprovadas');
     verificar(Carteira::saldo($pdo, $u) >= 0);
@@ -394,12 +410,12 @@ teste('compras simultâneas nunca deixam o saldo negativo', function () {
 });
 
 teste('compras simultâneas do mesmo item debitam uma única vez', function () {
-    [$pdo, $arquivo] = banco_novo();
+    [$pdo, $config] = banco_novo();
     $u = usuario($pdo);
     dar_moedas($pdo, $u, 20);
     $item = item_id($pdo, 'skin-aurora');
 
-    $sucessos = em_paralelo($arquivo, 4, fn(PDO $pdo) => (bool) Loja::comprar($pdo, $u, $item, agora()));
+    $sucessos = em_paralelo($config, 4, fn(PDO $pdo) => (bool) Loja::comprar($pdo, $u, $item, agora()));
 
     igual(1, $sucessos);
     igual(17, Carteira::saldo($pdo, $u));
@@ -469,10 +485,14 @@ foreach ($testes as $nome => $fn) {
         echo "  ✗ $nome\n      " . $e->getMessage() . "\n";
     }
 }
-// Remove os bancos temporários (e os arquivos de tempnam, WAL e backups criados ao lado).
-foreach ($GLOBALS['temporarios'] ?? [] as $arquivo) {
-    array_map('unlink', glob($arquivo . '*'));
-    @unlink(substr($arquivo, 0, -strlen('.sqlite')));
+// Remove os bancos temporários: schemas no PostgreSQL; no SQLite, os arquivos de tempnam, WAL e backups.
+foreach ($GLOBALS['temporarios'] ?? [] as $config) {
+    if ($config['driver'] === 'pgsql') {
+        Database::conectar(['schema' => null] + $config)->exec("DROP SCHEMA {$config['schema']} CASCADE");
+        continue;
+    }
+    array_map('unlink', glob($config['arquivo'] . '*'));
+    @unlink(substr($config['arquivo'], 0, -strlen('.sqlite')));
 }
 
 echo "\n" . (count($testes) - $falhas) . ' de ' . count($testes) . " testes passaram.\n";

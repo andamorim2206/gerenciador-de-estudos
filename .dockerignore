@@ -1,0 +1,6 @@
+.git
+data
+*.sqlite*
+Dockerfile
+docker-compose.yml
+.dockerignore

@@ -73,19 +73,24 @@ final class Neuronio
      */
     public static function somarXp(PDO $pdo, int $usuarioId, int $xp, string $agora): array
     {
-        $stmt = $pdo->prepare('SELECT xp_total, estagio_atual FROM progresso_neuronio WHERE usuario_id = ?');
-        $stmt->execute([$usuarioId]);
+        // A soma é feita no próprio UPDATE, que trava a linha até o fim da transação:
+        // dois créditos simultâneos nunca leem o mesmo XP antes de gravar.
+        $stmt = $pdo->prepare('UPDATE progresso_neuronio SET xp_total = xp_total + ?, atualizado_em = ?
+                               WHERE usuario_id = ? RETURNING xp_total, estagio_atual');
+        $stmt->execute([$xp, $agora, $usuarioId]);
         $atual = $stmt->fetch();
         if (!$atual) {
             throw new \RuntimeException('Usuário sem progresso do neurônio.');
         }
 
-        $novoXp = (int) $atual['xp_total'] + $xp;
+        $novoXp = (int) $atual['xp_total'];
         $estagioAntes = (int) $atual['estagio_atual'];
         $estagioDepois = max($estagioAntes, self::estagioPara($novoXp));
 
-        $pdo->prepare('UPDATE progresso_neuronio SET xp_total = ?, estagio_atual = ?, atualizado_em = ? WHERE usuario_id = ?')
-            ->execute([$novoXp, $estagioDepois, $agora, $usuarioId]);
+        if ($estagioDepois !== $estagioAntes) {
+            $pdo->prepare('UPDATE progresso_neuronio SET estagio_atual = ? WHERE usuario_id = ?')
+                ->execute([$estagioDepois, $usuarioId]);
+        }
 
         return ['xp_total' => $novoXp, 'estagio_antes' => $estagioAntes, 'estagio_depois' => $estagioDepois];
     }

@@ -17,7 +17,7 @@ final class Materias
                         WHERE s.materia_id = m.id AND s.status = \'concluida\') AS minutos
                 FROM materias m WHERE m.usuario_id = ?'
             . ($incluirArquivadas ? '' : ' AND m.arquivada_em IS NULL')
-            . ' ORDER BY m.arquivada_em IS NOT NULL, m.nome COLLATE NOCASE';
+            . ' ORDER BY m.arquivada_em IS NOT NULL, lower(m.nome)';
         $stmt = $pdo->prepare($sql);
         $stmt->execute([$usuarioId]);
         return $stmt->fetchAll();
@@ -109,6 +109,6 @@ final class Materias
 
     private static function traduzir(PDOException $e): \Throwable
     {
-        return str_contains($e->getMessage(), 'UNIQUE') ? new \DomainException('Essa matéria já existe.') : $e;
+        return Database::violaUnicidade($e) ? new \DomainException('Essa matéria já existe.') : $e;
     }
 }

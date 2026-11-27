@@ -69,7 +69,7 @@ final class Loja
             });
         } catch (PDOException $e) {
             // Duas compras simultâneas do mesmo item: o índice único barra a segunda, e o débito é desfeito.
-            if (str_contains($e->getMessage(), 'UNIQUE')) {
+            if (Database::violaUnicidade($e)) {
                 throw new \DomainException('Este item já está na sua coleção.');
             }
             throw $e;

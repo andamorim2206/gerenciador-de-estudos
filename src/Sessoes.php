@@ -23,6 +23,21 @@ final class Sessoes
             throw new \DomainException(sprintf('A duração deve ficar entre %d e %d minutos.', self::MIN_MINUTOS, self::MAX_MINUTOS));
         }
 
+        try {
+            return self::criar($pdo, $usuarioId, $materiaId, $minutos, $agora);
+        } catch (\PDOException $e) {
+            // Duas abas iniciando ao mesmo tempo: o índice de "uma sessão ativa" barra a segunda,
+            // que recebe a sessão criada pela primeira.
+            $ativa = Database::violaUnicidade($e) ? self::ativa($pdo, $usuarioId) : null;
+            if (!$ativa) {
+                throw $e;
+            }
+            return (int) $ativa['id'];
+        }
+    }
+
+    private static function criar(PDO $pdo, int $usuarioId, int $materiaId, int $minutos, DateTimeImmutable $agora): int
+    {
         return Database::transacao($pdo, function (PDO $pdo) use ($usuarioId, $materiaId, $minutos, $agora): int {
             $ativa = self::ativa($pdo, $usuarioId);
             if ($ativa) {
